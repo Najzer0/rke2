@@ -21,6 +21,7 @@ type TestConfig struct {
 	Agents         []DockerNode
 	ServerYaml     string
 	AgentYaml      string
+	DualStack      bool // If true, the docker containers will be attached to a dual-stack network
 }
 
 type DockerNode struct {
@@ -109,6 +110,21 @@ func (config *TestConfig) ProvisionServers(numOfServers int) error {
 			if _, err := RunCommand("sha256sum ../../../dist/artifacts/rke2.linux-amd64.tar.gz > ../../../dist/artifacts/sha256sum-amd64.txt"); err != nil {
 				return fmt.Errorf("failed to generate sha256sum file: %v", err)
 			}
+		} else if err != nil {
+			return fmt.Errorf("failed to check sha256sum file: %v", err)
+		}
+
+		dualStackConfig := ""
+		if config.DualStack {
+			// Check if the docker network exists, if not create it
+			networkName := "rke2-test-dualstack"
+			if _, err := RunCommand(fmt.Sprintf("docker network inspect %s", networkName)); err != nil {
+				cmd := fmt.Sprintf("docker network create --ipv6 --subnet=fd11:decf:c0ff:ee::/64 %s", networkName)
+				if _, err := RunCommand(cmd); err != nil {
+					return fmt.Errorf("failed to create dual-stack network: %v", err)
+				}
+			}
+			dualStackConfig = "--network rke2-test-dualstack"
 		}
 
 		dRun := strings.Join([]string{"docker run -d",
@@ -119,6 +135,7 @@ func (config *TestConfig) ProvisionServers(numOfServers int) error {
 			"--memory", "3072m",
 			"-e", fmt.Sprintf("RKE2_TOKEN=%s", config.Token),
 			joinServer,
+			dualStackConfig,
 			"-e", "RKE2_DEBUG=true",
 			"-e", "GOCOVERDIR=/tmp/rke2-cov",
 			"-e", "PATH=$PATH:/var/lib/rancher/rke2/bin",
@@ -174,7 +191,12 @@ func (config *TestConfig) ProvisionServers(numOfServers int) error {
 		}
 
 		// Get the IP address of the container
-		ipOutput, err := RunCommand("docker inspect --format \"{{ .NetworkSettings.IPAddress }}\" " + name)
+		if config.DualStack {
+			cmd = "docker inspect --format '{{range $k,$v := .NetworkSettings.Networks}}{{printf \"%s\" $v.IPAddress}}{{end}}' " + name
+		} else {
+			cmd = "docker inspect --format '{{ .NetworkSettings.IPAddress }}' " + name
+		}
+		ipOutput, err := RunCommand(cmd)
 		if err != nil {
 			return err
 		}
@@ -208,6 +230,11 @@ func (config *TestConfig) ProvisionAgents(numOfAgents int) error {
 				Name: name,
 			}
 
+			dualStackConfig := ""
+			if config.DualStack {
+				dualStackConfig = "--network rke2-test-dualstack"
+			}
+
 			dRun := strings.Join([]string{"docker run -d",
 				"--name", name,
 				"--hostname", name,
@@ -215,6 +242,7 @@ func (config *TestConfig) ProvisionAgents(numOfAgents int) error {
 				"--memory", "2048m",
 				"-e", fmt.Sprintf("RKE2_TOKEN=%s", config.Token),
 				"-e", fmt.Sprintf("RKE2_URL=%s", config.Servers[0].URL),
+				dualStackConfig,
 				"-e", "RKE2_DEBUG=true",
 				"-e", "GOCOVERDIR=/tmp/rke2-cov",
 				"-v", "/sys/fs/bpf:/sys/fs/bpf",
@@ -265,7 +293,12 @@ func (config *TestConfig) ProvisionAgents(numOfAgents int) error {
 			}
 
 			// Get the IP address of the container
-			ipOutput, err := RunCommand("docker inspect --format \"{{ .NetworkSettings.IPAddress }}\" " + name)
+			if config.DualStack {
+				cmd = "docker inspect --format '{{range $k,$v := .NetworkSettings.Networks}}{{printf \"%s\" $v.IPAddress}}{{end}}' " + name
+			} else {
+				cmd = "docker inspect --format '{{ .NetworkSettings.IPAddress }}' " + name
+			}
+			ipOutput, err := RunCommand(cmd)
 			if err != nil {
 				return err
 			}
@@ -273,7 +306,7 @@ func (config *TestConfig) ProvisionAgents(numOfAgents int) error {
 			newAgent.IP = ip
 			config.Agents = append(config.Agents, newAgent)
 
-			fmt.Printf("Started %s\n", name)
+			fmt.Printf("Started %s @ %s\n", newAgent.Name, newAgent.IP)
 			return nil
 		})
 	}
@@ -332,11 +365,26 @@ func (config *TestConfig) Cleanup() error {
 			errs = append(errs, err)
 		}
 	}
+	config.Servers = nil
 
 	// Stop and remove all agents
 	for _, agent := range config.Agents {
 		if err := config.RemoveNode(agent.Name); err != nil {
 			errs = append(errs, err)
+		}
+	}
+	config.Agents = nil
+
+	// Remove volumes created by the agent/server containers
+	cmd := fmt.Sprintf("docker volume ls -q | grep -F %s | xargs -r docker volume rm", strings.ToLower(filepath.Base(config.TestDir)))
+	if _, err := RunCommand(cmd); err != nil {
+		errs = append(errs, fmt.Errorf("failed to remove volumes: %v", err))
+	}
+
+	// Remove dual-stack network if it exists
+	if config.DualStack {
+		if _, err := RunCommand("docker network rm rke2-test-dualstack"); err != nil {
+			errs = append(errs, fmt.Errorf("failed to remove dual-stack network: %v", err))
 		}
 	}
 
@@ -348,8 +396,6 @@ func (config *TestConfig) Cleanup() error {
 	if config.TestDir != "" {
 		return os.RemoveAll(config.TestDir)
 	}
-	config.Agents = nil
-	config.Servers = nil
 	return nil
 }
 
@@ -414,13 +460,63 @@ func getEnvOrDefault(key, defaultValue string) string {
 	return defaultValue
 }
 
-// Dump the journalctl logs for the k3s service
+func (config *TestConfig) DumpResources() string {
+	cmd := "kubectl get pod,node -A -o wide --kubeconfig=" + config.KubeconfigFile
+	out, err := RunCommand(cmd)
+	if err != nil {
+		return fmt.Sprintf("Failed to run command %q: %v", cmd, err)
+	}
+	return out
+}
+
+// Dump pod logs for all nodes
+func (config *TestConfig) DumpPodLogs(lines int) string {
+	logs := &strings.Builder{}
+	cmd := fmt.Sprintf("tail -n %d /var/log/pods/*/*/*", lines)
+	for _, node := range append(config.Servers, config.Agents...) {
+		if l, err := node.RunCmdOnNode(cmd); err != nil {
+			fmt.Fprintf(logs, "** failed to tail pod logs for node %s ***\n%v\n", node.Name, err)
+		} else {
+			fmt.Fprintf(logs, "** pod logs for node %s ***\n%s\n", node.Name, l)
+		}
+	}
+	return logs.String()
+}
+
+// Dump kubelet and containerd logs for all nodes
+func (config *TestConfig) DumpComponentLogs(lines int) string {
+	logs := &strings.Builder{}
+	cmd := fmt.Sprintf("tail -n %d /var/lib/rancher/rke2/agent/containerd/containerd.log /var/lib/rancher/rke2/agent/logs/kubelet.log", lines)
+	for _, node := range append(config.Servers, config.Agents...) {
+		if l, err := node.RunCmdOnNode(cmd); err != nil {
+			fmt.Fprintf(logs, "** failed to tail component logs for node %s ***\n%v\n", node.Name, err)
+		} else {
+			fmt.Fprintf(logs, "** component logs for node %s ***\n%s\n", node.Name, l)
+		}
+	}
+	return logs.String()
+}
+
+// Dump journactl logs for all nodes
+func (config *TestConfig) DumpServiceLogs(lines int) string {
+	logs := &strings.Builder{}
+	for _, node := range append(config.Servers, config.Agents...) {
+		if l, err := node.DumpServiceLogs(lines); err != nil {
+			fmt.Fprintf(logs, "** failed to read journald log for node %s ***\n%v\n", node.Name, err)
+		} else {
+			fmt.Fprintf(logs, "** journald log for node %s ***\n%s\n", node.Name, l)
+		}
+	}
+	return logs.String()
+}
+
+// Dump the journalctl logs for the rke2 service
 func (node DockerNode) DumpServiceLogs(lines int) (string, error) {
 	var cmd string
 	if strings.Contains(node.Name, "agent") {
-		cmd = fmt.Sprintf("journalctl -u k3s-agent -n %d", lines)
+		cmd = fmt.Sprintf("journalctl -u rke2-agent -n %d", lines)
 	} else {
-		cmd = fmt.Sprintf("journalctl -u k3s -n %d", lines)
+		cmd = fmt.Sprintf("journalctl -u rke2-server -n %d", lines)
 	}
 	res, err := node.RunCmdOnNode(cmd)
 	if strings.Contains(res, "No entries") {

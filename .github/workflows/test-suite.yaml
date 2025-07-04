@@ -115,7 +115,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        dtest: [basics, secretsencryption]
+        dtest: [basics, dualstack, flannel, profile, secretsencryption]
     steps:
       - name: "Checkout"
         uses: actions/checkout@v4
@@ -135,6 +135,9 @@ jobs:
           mv ./artifacts/rke2-* ./build/images/
           mv ./artifacts/rke2.*-amd64.tar.gz ./dist/artifacts
           sha256sum ./dist/artifacts/rke2.linux-amd64.tar.gz > ./dist/artifacts/sha256sum-amd64.txt
+      - name: Load kernel modules
+        run: |
+          sudo modprobe br_netfilter overlay
       - name: Run ${{ matrix.dtest }} Test
         run: |
           go test -v -timeout=20m ./tests/docker/${{ matrix.dtest }}/${{ matrix.dtest }}_test.go -ginkgo.v -ci
@@ -169,6 +172,9 @@ jobs:
           mv ./artifacts/rke2-* ./build/images/
           mv ./artifacts/rke2.*-amd64.tar.gz ./dist/artifacts
           sha256sum ./dist/artifacts/rke2.linux-amd64.tar.gz > ./dist/artifacts/sha256sum-amd64.txt
+      - name: Load kernel modules
+        run: |
+          sudo modprobe br_netfilter overlay
       - name: Run ${{ matrix.dtest }} Test
         run: |
           go test -v -timeout=30m ./tests/docker/${{ matrix.dtest }}/${{ matrix.dtest }}_test.go -ginkgo.v -ci
@@ -180,7 +186,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        etest: [dnscache, kine, ciliumnokp, multus]
+        etest: [kine, ciliumnokp, multus]
       max-parallel: 3
     steps:
     - name: "Checkout"
@@ -189,8 +195,16 @@ jobs:
     
     - name: Set up vagrant and libvirt
       uses: ./.github/actions/vagrant-setup
-    - name: "Vagrant Cache"
+    - name: Vagrant R/W Cache
+      if: github.ref == 'refs/heads/master'
       uses: actions/cache@v4
+      with:
+        path: |
+            ~/.vagrant.d/boxes
+        key: vagrant-box-ubuntu-2404
+    - name: Vagrant Read Cache
+      if: github.ref != 'refs/heads/master'
+      uses: actions/cache/restore@v4
       with:
         path: |
             ~/.vagrant.d/boxes

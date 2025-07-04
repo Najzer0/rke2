@@ -150,7 +150,7 @@ func initExecutor(clx *cli.Context, cfg Config, isServer bool) (*podexecutor.Sta
 
 	containerRuntimeEndpoint := cmds.AgentConfig.ContainerRuntimeEndpoint
 	if containerRuntimeEndpoint == "" {
-		containerRuntimeEndpoint = containerdSock
+		containerRuntimeEndpoint = podexecutor.ContainerdSock
 	}
 
 	var ingressControllerName string
@@ -162,7 +162,7 @@ func initExecutor(clx *cli.Context, cfg Config, isServer bool) (*podexecutor.Sta
 		Resolver:               resolver,
 		ImagesDir:              agentImagesDir,
 		ManifestsDir:           agentManifestsDir,
-		CISMode:                isCISMode(clx),
+		ProfileMode:            setProfileMode(clx),
 		CloudProvider:          cpConfig,
 		DataDir:                dataDir,
 		AuditPolicyFile:        clx.String("audit-policy-file"),
